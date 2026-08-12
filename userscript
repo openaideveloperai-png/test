@@ -1,0 +1,1057 @@
+// ==UserScript==
+// @name         Websim Presence Controller
+// @namespace    https://websim.com/
+// @version      9.0.0
+// @description  Automatic persistent Websim presence controller
+// @match        https://websim.com/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(() => {
+    "use strict";
+
+    // NEVER run inside an iframe/project page.
+    if (window.top !== window.self) {
+        return;
+    }
+
+    const STORAGE_KEY = "__ws_presence_project";
+
+    let projectCode = null;
+    let projectId = null;
+    let clientId = null;
+    let ttl = 90;
+
+    let running = false;
+    let connecting = false;
+
+    let reader = null;
+    let refreshTimer = null;
+
+    let uiHost = null;
+    let shadow = null;
+
+    // ------------------------------------------------------------
+    // PROJECT DETECTION
+    // ------------------------------------------------------------
+
+    function extractProjectCode(text) {
+        if (!text) return null;
+
+        const match = String(text).match(
+            /(?:https?:\/\/)?([a-zA-Z0-9_-]+)\.c\.websim\.com\b/
+        );
+
+        return match ? match[1] : null;
+    }
+
+    function detectProject() {
+        let code;
+
+        // Current URL / hostname
+        code = extractProjectCode(location.href);
+        if (code) return code;
+
+        code = extractProjectCode(location.hostname);
+        if (code) return code;
+
+        // Performance resources
+        try {
+            for (
+                const entry of
+                performance.getEntriesByType("resource")
+            ) {
+                code = extractProjectCode(entry.name);
+
+                if (code) {
+                    return code;
+                }
+            }
+        } catch {}
+
+        // Actual page HTML
+        try {
+            const html =
+                document.documentElement?.outerHTML || "";
+
+            code = extractProjectCode(html);
+
+            if (code) {
+                return code;
+            }
+        } catch {}
+
+        // Links / iframes
+        try {
+            const elements =
+                document.querySelectorAll(
+                    "a[href], iframe[src], script[src]"
+                );
+
+            for (const element of elements) {
+                code = extractProjectCode(
+                    element.href ||
+                    element.src ||
+                    ""
+                );
+
+                if (code) {
+                    return code;
+                }
+            }
+        } catch {}
+
+        // Previously detected project for this tab
+        try {
+            code =
+                sessionStorage.getItem(
+                    STORAGE_KEY
+                );
+
+            if (
+                code &&
+                /^[a-zA-Z0-9_-]+$/.test(code)
+            ) {
+                return code;
+            }
+        } catch {}
+
+        return null;
+    }
+
+    function setProject(code) {
+        if (!code) {
+            return false;
+        }
+
+        projectCode = code;
+        projectId = `project_${code}`;
+
+        try {
+            sessionStorage.setItem(
+                STORAGE_KEY,
+                code
+            );
+        } catch {}
+
+        updateProjectUI();
+
+        return true;
+    }
+
+    // ------------------------------------------------------------
+    // UI
+    // ------------------------------------------------------------
+
+    function createUI() {
+        if (
+            uiHost &&
+            uiHost.isConnected
+        ) {
+            return;
+        }
+
+        if (!document.documentElement) {
+            return;
+        }
+
+        uiHost =
+            document.createElement("div");
+
+        uiHost.id =
+            "__ws_presence_controller";
+
+        Object.assign(
+            uiHost.style,
+            {
+                position: "fixed",
+                top: "0",
+                left: "0",
+                width: "0",
+                height: "0",
+                overflow: "visible",
+                zIndex: "2147483647",
+                pointerEvents: "none"
+            }
+        );
+
+        document.documentElement.appendChild(
+            uiHost
+        );
+
+        shadow =
+            uiHost.attachShadow({
+                mode: "open"
+            });
+
+        const style =
+            document.createElement("style");
+
+        style.textContent = `
+            #panel {
+                position: fixed;
+                top: 20px;
+                right: 20px;
+
+                width: 410px;
+
+                padding: 16px;
+                box-sizing: border-box;
+
+                background: #101218;
+                color: white;
+
+                border: 1px solid #343946;
+                border-radius: 14px;
+
+                box-shadow:
+                    0 15px 50px rgba(0,0,0,.55);
+
+                font-family: Arial, sans-serif;
+
+                pointer-events: auto;
+            }
+
+            #title {
+                font-size: 18px;
+                font-weight: 700;
+                margin-bottom: 14px;
+                cursor: move;
+                user-select: none;
+            }
+
+            .label {
+                color: #8f95a5;
+                font-size: 11px;
+                margin-bottom: 5px;
+            }
+
+            #project {
+                padding: 9px;
+                background: #191c24;
+                border-radius: 8px;
+
+                font-family: monospace;
+
+                word-break: break-all;
+            }
+
+            #host {
+                color: #707787;
+                font-size: 10px;
+
+                margin-top: 5px;
+                margin-bottom: 12px;
+            }
+
+            textarea {
+                width: 100%;
+                height: 190px;
+
+                box-sizing: border-box;
+
+                padding: 9px;
+
+                resize: vertical;
+
+                background: #181b22;
+                color: #eee;
+
+                border: 1px solid #3b3f4b;
+                border-radius: 8px;
+
+                font-family:
+                    Consolas, monospace;
+
+                font-size: 12px;
+                line-height: 1.45;
+            }
+
+            .buttons {
+                display: flex;
+                gap: 8px;
+
+                margin-top: 10px;
+                margin-bottom: 8px;
+            }
+
+            button {
+                flex: 1;
+
+                padding: 9px;
+
+                border: 0;
+                border-radius: 8px;
+
+                color: white;
+                font-weight: 700;
+
+                cursor: pointer;
+            }
+
+            button:disabled {
+                opacity: .5;
+                cursor: default;
+            }
+
+            #start {
+                background: #2f9e44;
+            }
+
+            #stop {
+                background: #c92a2a;
+            }
+
+            #redetect {
+                width: 100%;
+
+                background: #1b1f27;
+
+                border:
+                    1px solid #3b404c;
+            }
+
+            #status {
+                margin-top: 8px;
+
+                padding: 9px;
+
+                background: #191c24;
+
+                color: #b8becb;
+
+                border-radius: 8px;
+
+                font-size: 11px;
+                line-height: 1.5;
+
+                white-space: pre-wrap;
+                word-break: break-word;
+            }
+        `;
+
+        shadow.appendChild(style);
+
+        const panel =
+            document.createElement("div");
+
+        panel.id = "panel";
+
+        panel.innerHTML = `
+            <div id="title">
+                Websim Presence
+            </div>
+
+            <div class="label">
+                Current project
+            </div>
+
+            <div id="project">
+                Detecting...
+            </div>
+
+            <div id="host"></div>
+
+            <div class="label">
+                JSON to POST
+            </div>
+
+            <textarea id="json" spellcheck="false">{
+  "data": {
+    "id": "this is a bug i found if any websim admin is seeing this contact function09x24488 on discord",
+    "name": "Sousuke Aizen",
+    "url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSb1Y3lytCvU1YqHH-zMdSbCMl_eS_oYFAH_8RED7SBJSXwA-dDRvYSlbo&s=10",
+    "t": false
+  }
+}</textarea>
+
+            <div class="buttons">
+                <button id="start">
+                    Start
+                </button>
+
+                <button id="stop" disabled>
+                    Stop
+                </button>
+            </div>
+
+            <button id="redetect">
+                Re-detect Project
+            </button>
+
+            <div id="status">
+                Initializing...
+            </div>
+        `;
+
+        shadow.appendChild(panel);
+
+        // Buttons
+        shadow
+            .querySelector("#start")
+            .addEventListener(
+                "click",
+                start
+            );
+
+        shadow
+            .querySelector("#stop")
+            .addEventListener(
+                "click",
+                stop
+            );
+
+        shadow
+            .querySelector("#redetect")
+            .addEventListener(
+                "click",
+                () => {
+                    const code =
+                        detectProject();
+
+                    if (!code) {
+                        setStatus(
+                            "Project not detected."
+                        );
+                        return;
+                    }
+
+                    setProject(code);
+
+                    setStatus(
+                        `Detected:\n${projectId}`
+                    );
+
+                    if (!running) {
+                        start();
+                    }
+                }
+            );
+
+        // Drag panel
+        const title =
+            shadow.querySelector("#title");
+
+        let dragging = false;
+        let offsetX = 0;
+        let offsetY = 0;
+
+        title.addEventListener(
+            "mousedown",
+            event => {
+                dragging = true;
+
+                const rect =
+                    panel.getBoundingClientRect();
+
+                offsetX =
+                    event.clientX -
+                    rect.left;
+
+                offsetY =
+                    event.clientY -
+                    rect.top;
+            }
+        );
+
+        window.addEventListener(
+            "mousemove",
+            event => {
+                if (!dragging) return;
+
+                panel.style.left =
+                    `${event.clientX - offsetX}px`;
+
+                panel.style.top =
+                    `${event.clientY - offsetY}px`;
+
+                panel.style.right =
+                    "auto";
+            }
+        );
+
+        window.addEventListener(
+            "mouseup",
+            () => {
+                dragging = false;
+            }
+        );
+
+        updateProjectUI();
+        updateButtons();
+    }
+
+    function ensureUI() {
+        if (
+            !uiHost ||
+            !uiHost.isConnected
+        ) {
+            createUI();
+        }
+    }
+
+    function setStatus(text) {
+        ensureUI();
+
+        const status =
+            shadow?.querySelector(
+                "#status"
+            );
+
+        if (status) {
+            status.textContent = text;
+        }
+    }
+
+    function updateProjectUI() {
+        ensureUI();
+
+        const project =
+            shadow?.querySelector(
+                "#project"
+            );
+
+        const host =
+            shadow?.querySelector(
+                "#host"
+            );
+
+        if (project) {
+            project.textContent =
+                projectId ||
+                "Detecting...";
+        }
+
+        if (host) {
+            host.textContent =
+                projectCode
+                    ? `${projectCode}.c.websim.com`
+                    : "";
+        }
+    }
+
+    function updateButtons() {
+        ensureUI();
+
+        const start =
+            shadow?.querySelector(
+                "#start"
+            );
+
+        const stop =
+            shadow?.querySelector(
+                "#stop"
+            );
+
+        if (!start || !stop) {
+            return;
+        }
+
+        start.disabled =
+            running;
+
+        stop.disabled =
+            !running;
+    }
+
+    // ------------------------------------------------------------
+    // GET / SSE
+    // ------------------------------------------------------------
+
+    async function connectSSE() {
+        if (!running || !projectId) {
+            return;
+        }
+
+        const url =
+            `/api-web/v1/presence/` +
+            encodeURIComponent(projectId);
+
+        setStatus(
+            `GET /presence\n\n${projectId}`
+        );
+
+        /*
+         * Normal fetch.
+         *
+         * No global fetch patching.
+         * No XHR patching.
+         * No EventSource patching.
+         */
+        const response =
+            await fetch(
+                url,
+                {
+                    method: "GET",
+
+                    credentials:
+                        "include",
+
+                    cache:
+                        "no-store",
+
+                    headers: {
+                        "Accept":
+                            "text/event-stream",
+
+                        "Cache-Control":
+                            "no-cache"
+                    }
+                }
+            );
+
+        if (!response.ok) {
+            throw new Error(
+                `GET failed: HTTP ${response.status}`
+            );
+        }
+
+        if (!response.body) {
+            throw new Error(
+                "GET returned no readable stream."
+            );
+        }
+
+        reader =
+            response.body.getReader();
+
+        const decoder =
+            new TextDecoder();
+
+        let buffer = "";
+
+        while (running) {
+            const result =
+                await reader.read();
+
+            if (result.done) {
+                throw new Error(
+                    "SSE connection closed."
+                );
+            }
+
+            buffer +=
+                decoder.decode(
+                    result.value,
+                    { stream: true }
+                );
+
+            const events =
+                buffer.split(
+                    /\r?\n\r?\n/
+                );
+
+            buffer =
+                events.pop() || "";
+
+            for (
+                const eventBlock of events
+            ) {
+                let eventName = "";
+                let data = "";
+
+                for (
+                    const line of
+                    eventBlock.split(/\r?\n/)
+                ) {
+                    if (
+                        line.startsWith(
+                            "event:"
+                        )
+                    ) {
+                        eventName =
+                            line
+                                .slice(6)
+                                .trim();
+                    }
+
+                    if (
+                        line.startsWith(
+                            "data:"
+                        )
+                    ) {
+                        data +=
+                            line
+                                .slice(5)
+                                .trim();
+                    }
+                }
+
+                if (
+                    eventName === "init" &&
+                    data
+                ) {
+                    let init;
+
+                    try {
+                        init =
+                            JSON.parse(data);
+                    } catch {
+                        continue;
+                    }
+
+                    if (!init.client_id) {
+                        continue;
+                    }
+
+                    clientId =
+                        init.client_id;
+
+                    ttl =
+                        Number(init.ttl) || 90;
+
+                    setStatus(
+                        `CONNECTED\n\n` +
+                        `Project: ${projectId}\n` +
+                        `Client ID: ${clientId}\n` +
+                        `TTL: ${ttl}s\n\n` +
+                        `POSTING...`
+                    );
+
+                    // FIRST POST IMMEDIATELY
+                    try {
+                        await postPresence();
+
+                        setStatus(
+                            `CONNECTED\n\n` +
+                            `POST SUCCESSFUL\n\n` +
+                            `Client ID: ${clientId}\n` +
+                            `SSE: OPEN`
+                        );
+
+                        scheduleRefresh();
+
+                    } catch (error) {
+                        setStatus(
+                            `POST ERROR\n\n${error.message}`
+                        );
+
+                        scheduleRetry();
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------
+    // POST
+    // ------------------------------------------------------------
+
+    async function postPresence() {
+        if (!projectId) {
+            throw new Error(
+                "Project ID missing."
+            );
+        }
+
+        if (!clientId) {
+            throw new Error(
+                "Client ID missing."
+            );
+        }
+
+        const textarea =
+            shadow?.querySelector(
+                "#json"
+            );
+
+        if (!textarea) {
+            throw new Error(
+                "JSON editor missing."
+            );
+        }
+
+        let payload;
+
+        try {
+            payload =
+                JSON.parse(
+                    textarea.value
+                );
+        } catch {
+            throw new Error(
+                "Invalid JSON."
+            );
+        }
+
+        const url =
+            `/api-web/v1/presence/` +
+            `${encodeURIComponent(projectId)}/` +
+            `${encodeURIComponent(clientId)}`;
+
+        console.log(
+            "[Websim Presence] POST",
+            url,
+            payload
+        );
+
+        const response =
+            await fetch(
+                url,
+                {
+                    method: "POST",
+
+                    credentials:
+                        "include",
+
+                    cache:
+                        "no-store",
+
+                    headers: {
+                        "Content-Type":
+                            "application/json",
+
+                        "Accept":
+                            "*/*"
+                    },
+
+                    body:
+                        JSON.stringify(payload)
+                }
+            );
+
+        const text =
+            await response.text();
+
+        console.log(
+            "[Websim Presence]",
+            response.status,
+            text
+        );
+
+        if (!response.ok) {
+            throw new Error(
+                `POST failed: HTTP ${response.status}\n${text}`
+            );
+        }
+    }
+
+    // ------------------------------------------------------------
+    // REFRESH
+    // ------------------------------------------------------------
+
+    function scheduleRefresh() {
+        if (!running) return;
+
+        if (refreshTimer) {
+            clearTimeout(refreshTimer);
+        }
+
+        const delay =
+            Math.max(
+                15000,
+                (ttl - 15) * 1000
+            );
+
+        refreshTimer =
+            setTimeout(
+                async () => {
+                    if (!running) return;
+
+                    try {
+                        await postPresence();
+
+                        setStatus(
+                            `CONNECTED\n\n` +
+                            `PRESENCE REFRESHED\n\n` +
+                            `Client ID: ${clientId}\n` +
+                            `SSE: OPEN`
+                        );
+
+                        scheduleRefresh();
+
+                    } catch (error) {
+                        setStatus(
+                            `REFRESH FAILED\n\n${error.message}`
+                        );
+
+                        scheduleRetry();
+                    }
+                },
+                delay
+            );
+    }
+
+    function scheduleRetry() {
+        if (!running) return;
+
+        if (refreshTimer) {
+            clearTimeout(refreshTimer);
+        }
+
+        refreshTimer =
+            setTimeout(
+                async () => {
+                    if (!running) return;
+
+                    try {
+                        await postPresence();
+
+                        setStatus(
+                            `CONNECTED\n\n` +
+                            `POST RETRY SUCCESSFUL\n\n` +
+                            `Client ID: ${clientId}`
+                        );
+
+                        scheduleRefresh();
+
+                    } catch {
+                        scheduleRetry();
+                    }
+                },
+                5000
+            );
+    }
+
+    // ------------------------------------------------------------
+    // START
+    // ------------------------------------------------------------
+
+    async function start() {
+        if (running || connecting) {
+            return;
+        }
+
+        const detected =
+            detectProject();
+
+        if (detected) {
+            setProject(detected);
+        }
+
+        if (!projectId) {
+            setStatus(
+                "Waiting for project..."
+            );
+            return;
+        }
+
+        connecting = true;
+        running = true;
+
+        updateButtons();
+
+        try {
+            await connectSSE();
+
+        } catch (error) {
+            console.error(
+                "[Websim Presence] SSE error:",
+                error
+            );
+
+            if (running) {
+                setStatus(
+                    `SSE ERROR\n\n${error.message}`
+                );
+            }
+
+            running = false;
+
+        } finally {
+            connecting = false;
+            updateButtons();
+        }
+    }
+
+    // ------------------------------------------------------------
+    // STOP
+    // ------------------------------------------------------------
+
+    async function stop() {
+        running = false;
+        connecting = false;
+
+        if (refreshTimer) {
+            clearTimeout(
+                refreshTimer
+            );
+            refreshTimer = null;
+        }
+
+        if (reader) {
+            try {
+                await reader.cancel();
+            } catch {}
+
+            reader = null;
+        }
+
+        clientId = null;
+
+        updateButtons();
+        setStatus("STOPPED");
+    }
+
+    // ------------------------------------------------------------
+    // DETECTION
+    // ------------------------------------------------------------
+
+    function beginDetection() {
+        let attempts = 0;
+
+        const timer =
+            setInterval(
+                () => {
+                    if (running) {
+                        clearInterval(timer);
+                        return;
+                    }
+
+                    const detected =
+                        detectProject();
+
+                    if (detected) {
+                        clearInterval(timer);
+
+                        setProject(
+                            detected
+                        );
+
+                        start();
+
+                        return;
+                    }
+
+                    attempts++;
+
+                    if (attempts >= 120) {
+                        clearInterval(timer);
+
+                        setTimeout(
+                            beginDetection,
+                            1000
+                        );
+                    }
+                },
+                250
+            );
+    }
+
+    // ------------------------------------------------------------
+    // KEEP UI
+    // ------------------------------------------------------------
+
+    setInterval(
+        ensureUI,
+        1000
+    );
+
+    // ------------------------------------------------------------
+    // INITIALIZE
+    // ------------------------------------------------------------
+
+    createUI();
+
+    const immediate =
+        detectProject();
+
+    if (immediate) {
+        setProject(immediate);
+        start();
+    } else {
+        beginDetection();
+    }
+
+})();
